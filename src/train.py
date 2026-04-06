@@ -6,6 +6,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 import hydra 
 from omegaconf import DictConfig, OmegaConf
+import wandb
 
 from eval import evaluate
 from models import LinkPredictor
@@ -34,12 +35,20 @@ def train_step(model,optimizer,train_data,criterion):
 @hydra.main(version_base=None,config_path="conf",config_name="config")
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
+    # wandb init 
+    wandb.init(
+        project="link-prediction-gcn",
+        config=OmegaConf.to_container(cfg, resolve=True),
+        name=f"gcn_h{cfg.model.hidden_channels}_lr{cfg.training.lr}",
+    )
+    
     # load the data 
     graph_data = make_datasets(cfg)
     # split the train/test/val
     edge_index = graph_data.edge_index
     edge_label = graph_data.edge_label
     X_gcn = graph_data.x
+    print("Total number of nodes",X_gcn.shape[0])
     # edge_index: [2, E]
     # edge_label: [E]
     # only the positive edges here 
@@ -87,23 +96,36 @@ def main(cfg: DictConfig):
     # instantiate the model
     in_channels = train_data.x.size(1)
     model = LinkPredictor(in_channels, cfg.model.hidden_channels, cfg.model.out_channels).to(device)
+    wandb.watch(model, log="all")
 
     train_data = train_data.to(device)
     val_data = val_data.to(device)
     test_data = test_data.to(device)
 
-    optimizer = AdamW(model.parameters(), lr=0.01)
+    optimizer = AdamW(model.parameters(), lr=cfg.training.lr,weight_decay=cfg.training.wd)
     criterion = nn.BCEWithLogitsLoss()
 
 
 
     for epoch in range(1, cfg.training.epochs):
         loss = train_step(model,optimizer,train_data,criterion)
+        wandb.log({"epoch":epoch,"train_loss":loss})
         if epoch % 100 == 0:
-            val_acc, val_auc, val_ap = evaluate(val_data,model)
+            val_loss, val_acc, val_auc, val_ap = evaluate(val_data,model,criterion)
             print(f"epoch {epoch:03d}, loss: {loss:.4f}, val acc {val_acc:.4f}, Val AUC: {val_auc:.4f}, Val AP: {val_ap:.4f}")
+            wandb.log({
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "val_auc": val_auc,
+                "val_ap": val_ap
+            })
 
-    test_acc, test_auc, test_ap = evaluate(test_data,model)
+    _, test_acc, test_auc, test_ap = evaluate(test_data,model,criterion)
+    wandb.log({
+        "test_acc": test_acc,
+        "test_auc": test_auc,
+        "test_ap": test_ap
+    })
     print(f"test acc {test_acc:.4f}, Test AUC: {test_auc:.4f}, Test AP: {test_ap:.4f}")
 
 if __name__ == "__main__" :

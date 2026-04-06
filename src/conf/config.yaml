@@ -1,9 +1,11 @@
 model : 
-  hidden_channels : 128 
+  hidden_channels : 64 
   out_channels : 16 
 
 training : 
-  epochs : 1000
+  epochs : 10000
+  wd : 1.0
+  lr : 0.01
 
 data :
   DATA_BASE_PATH : "data/"
