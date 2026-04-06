@@ -4,8 +4,8 @@ import polars
 import numpy as np
 
 def make_datasets(cfg) : 
-    data_node = polars.read_csv(cfg.data.DATA_BASE_PATH + "node_information.csv")
-    edges_df = polars.read_csv(cfg.data.DATA_BASE_PATH + "train.txt", separator=" ", has_header=False, new_columns=["a", "b", "label"])
+    data_node = polars.read_csv("../../../" + cfg.data.DATA_BASE_PATH + "node_information.csv")
+    edges_df = polars.read_csv("../../../" + cfg.data.DATA_BASE_PATH + "train.txt", separator=" ", has_header=False, new_columns=["a", "b", "label"])
     node_array = data_node.to_numpy()
     edge_array = edges_df.to_numpy()
 

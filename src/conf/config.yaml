@@ -1,12 +1,21 @@
+hydra :
+  job : 
+    chdir : True
+
 model : 
   hidden_channels : 64 
   out_channels : 16 
 
 training : 
-  epochs : 10000
+  epochs : 1000
   wd : 1.0
   lr : 0.01
 
 data :
   DATA_BASE_PATH : "data/"
   test_size : 0.2
+
+inference:
+  checkpoint_path: "best_model.pt"
+  submit: false
+  message: "GCN baseline"

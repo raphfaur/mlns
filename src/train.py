@@ -106,7 +106,7 @@ def main(cfg: DictConfig):
     criterion = nn.BCEWithLogitsLoss()
 
 
-
+    best_val_auc = -1.0
     for epoch in range(1, cfg.training.epochs):
         loss = train_step(model,optimizer,train_data,criterion)
         wandb.log({"epoch":epoch,"train_loss":loss})
@@ -119,7 +119,14 @@ def main(cfg: DictConfig):
                 "val_auc": val_auc,
                 "val_ap": val_ap
             })
-
+            if val_auc > best_val_auc:
+                best_val_auc = val_auc
+                save_path = "best_model.pt"
+                torch.save(model.state_dict(), save_path)
+                wandb.save(save_path)
+                print(f"!!! new best model saved (AUC={val_auc:.4f})")
+    
+    model.load_state_dict(torch.load("best_model.pt"))
     _, test_acc, test_auc, test_ap = evaluate(test_data,model,criterion)
     wandb.log({
         "test_acc": test_acc,
