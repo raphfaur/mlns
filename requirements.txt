@@ -1,5 +1,0 @@
-polars
-scikit-learn
-xgboost
-karateclub
-networkx

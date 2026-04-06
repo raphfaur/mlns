@@ -1,0 +1,8 @@
+model:
+  hidden_channels: 128
+  out_channels: 16
+training:
+  epochs: 1000
+data:
+  DATA_BASE_PATH: data/
+  test_size: 0.2
