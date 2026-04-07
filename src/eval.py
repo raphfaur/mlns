@@ -12,8 +12,12 @@ def evaluate(split_data,model,criterion):
     loss = criterion(logits, split_data.edge_label.float())
     probs = torch.sigmoid(logits).cpu().numpy()
     y_true = split_data.edge_label.cpu().numpy()
-    auc = roc_auc_score(y_true, probs)
-    ap = average_precision_score(y_true, probs) # ? 
+    if len(set(y_true.tolist())) < 2:
+        auc = float("nan")
+        ap = float("nan")
+    else:
+        auc = roc_auc_score(y_true, probs)
+        ap = average_precision_score(y_true, probs)
     y_pred = (probs >= 0.5).astype(int) 
     acc = accuracy_score(y_true,y_pred)
-    return loss, acc, auc, ap
+    return loss.item(), acc, auc, ap

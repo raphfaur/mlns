@@ -3,13 +3,57 @@ hydra :
     chdir : True
 
 model : 
-  hidden_channels : 64 
-  out_channels : 16 
+  kind : "gnn"
+  hidden_channels : 64
+  out_channels : 32
+  decoder_hidden : 64
+  dropout : 0.4
+  edge_dropout : 0.15
+  feature_dropout : 0.08
+  decoder_scale_init : 5.0
+
+pair_mlp:
+  node_feature_source : "raw"
+  proj_dim : 64
+  hidden_dim_1 : 64
+  hidden_dim_2 : 32
+  dropout_1 : 0.30
+  dropout_2 : 0.25
+  dropout_3 : 0.15
+  batch_size : 256
+  lr : 0.0002
+  wd : 0.005
+  epochs : 140
+  eval_every : 1
+  patience : 18
+  min_delta : 0.00001
+  use_scheduler : false
+  full_train_epochs : 6
+  pagerank_alpha : 0.85
+  katz_alpha : 0.005
+  katz_beta : 1.0
+  katz_max_iter : 1000
+  katz_tol : 1.0e-6
 
 training : 
-  epochs : 1000
-  wd : 1.0
-  lr : 0.01
+  epochs : 3000
+  wd : 0.002
+  lr : 0.001
+  eval_every : 5
+  patience : 1000
+  min_delta : 0.0005
+  lr_patience : 3
+  lr_decay_factor : 0.5
+  min_lr : 0.00005
+  label_smoothing : 0.0
+  grad_clip : 1.0
+
+preprocessing:
+  log1p : false
+  use_truncated_svd : false
+  svd_dim : 64
+  svd_n_iter : 7
+  random_state : 42
 
 data :
   DATA_BASE_PATH : "data/"
@@ -17,5 +61,7 @@ data :
 
 inference:
   checkpoint_path: "best_model.pt"
-  submit: false
+  refit_on_full_train: false
+  full_train_epochs: 200
+  submit: true
   message: "GCN baseline"

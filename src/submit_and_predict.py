@@ -1,17 +1,33 @@
 import subprocess
+
 import numpy as np
 import polars as pl
 import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 import hydra
 from omegaconf import DictConfig, OmegaConf
 from torch_geometric.data import Data
 
-from models import LinkPredictor
+from make_dataset import build_node_features
+from models import build_model
+from pair_features import (
+    apply_feature_scaler,
+    build_node_feature_mapping,
+    build_pair_feature_matrix,
+    build_positive_graph,
+    compute_centrality_maps,
+    fit_feature_scaler,
+    load_pair_arrays,
+)
 
 
-def build_test_data(cfg):
+def build_gnn_test_data(cfg):
     base = cfg.data.DATA_BASE_PATH
-    data_node = pl.read_csv("../../../" + base + "node_information.csv")
+    data_node = pl.read_csv(
+        "../../../" + base + "node_information.csv",
+        has_header=False,
+    )
     train_df = pl.read_csv(
         "../../../" + base + "train.txt",
         separator=" ",
@@ -28,127 +44,255 @@ def build_test_data(cfg):
     train_array = train_df.to_numpy()
     test_array = test_df.to_numpy()
 
-    
-    remapping = {}
-    X_gcn = []
+    x_gnn, remapping = build_node_features(node_array, cfg)
 
-    for i, row in enumerate(node_array):
-        node_id = row[0]
-        features = np.array(row[1:], dtype=np.float32)
-        remapping[node_id] = i
-        X_gcn.append(features)
-
-    X_gcn = torch.tensor(np.array(X_gcn), dtype=torch.float)
-
-    
     train_edges = train_array[:, :2]
     train_labels = train_array[:, 2]
-
     sender = []
     receiver = []
 
     for edge, label in zip(train_edges, train_labels):
         if label != 1:
             continue
-
         node_i, node_j = edge[0], edge[1]
-
         if node_i not in remapping or node_j not in remapping:
             continue
-
-        i = remapping[node_i]
-        j = remapping[node_j]
-
-        sender.append(i)
-        receiver.append(j)
+        sender.append(remapping[node_i])
+        receiver.append(remapping[node_j])
 
     edge_index = torch.tensor([sender, receiver], dtype=torch.long)
 
-    
-    
     test_sender = []
     test_receiver = []
     valid_mask = []
     for edge in test_array:
         node_i, node_j = edge[0], edge[1]
-
         if node_i in remapping and node_j in remapping:
-            i = remapping[node_i]
-            j = remapping[node_j]
-            test_sender.append(i)
-            test_receiver.append(j)
+            test_sender.append(remapping[node_i])
+            test_receiver.append(remapping[node_j])
             valid_mask.append(True)
         else:
             valid_mask.append(False)
 
-    test_edge_label_index = torch.tensor(
-        [test_sender, test_receiver], dtype=torch.long
-    )
-
-    test_data = Data(
-        x=X_gcn,
-        edge_index=edge_index,
-        edge_label_index=test_edge_label_index,
-    )
-
-    return test_data, test_df, np.array(valid_mask) 
-
-    
+    test_edge_label_index = torch.tensor([test_sender, test_receiver], dtype=torch.long)
+    test_data = Data(x=x_gnn, edge_index=edge_index, edge_label_index=test_edge_label_index)
+    return test_data, test_df, np.array(valid_mask, dtype=bool)
 
 
 @torch.no_grad()
-def predict(model, data, device):
+def predict_gnn(model, data, device):
     model.eval()
     data = data.to(device)
-
     logits = model(data.x, data.edge_index, data.edge_label_index)
     probs = torch.sigmoid(logits).cpu().numpy()
     preds = (probs >= 0.5).astype(int)
-
     return probs, preds
+
+
+@torch.no_grad()
+def predict_pair_mlp(model, features, device, batch_size):
+    model.eval()
+    loader = DataLoader(
+        TensorDataset(torch.tensor(features, dtype=torch.float32)),
+        batch_size=batch_size,
+        shuffle=False,
+    )
+
+    all_probs = []
+    for (xb,) in loader:
+        logits = model(xb.to(device))
+        probs = torch.sigmoid(logits).cpu().numpy()
+        all_probs.append(probs)
+
+    probs = np.concatenate(all_probs, axis=0)
+    preds = (probs >= 0.5).astype(int)
+    return probs, preds
+
+
+def build_pair_submit_features(cfg, topology_pairs):
+    node_array, train_array, test_df = load_pair_arrays(cfg, include_test=True)
+    node_features, remapping = build_node_feature_mapping(node_array, cfg)
+    topo_graph = build_positive_graph(topology_pairs)
+    pagerank_map, katz_map = compute_centrality_maps(topo_graph, cfg)
+
+    test_pairs = test_df.to_numpy().astype(np.int64)
+    x_submit, valid_mask = build_pair_feature_matrix(
+        test_pairs,
+        node_features,
+        remapping,
+        topo_graph,
+        pagerank_map,
+        katz_map,
+        fill_missing=True,
+    )
+    return x_submit, test_df, valid_mask
+
+
+def fit_pair_mlp_full_train(cfg, device):
+    node_array, train_array, test_df = load_pair_arrays(cfg, include_test=True)
+    node_features, remapping = build_node_feature_mapping(node_array, cfg)
+
+    full_pairs = train_array[:, :2].astype(np.int64)
+    full_labels = train_array[:, 2].astype(np.float32)
+    topology_pairs = full_pairs[full_labels == 1]
+
+    topo_graph = build_positive_graph(topology_pairs)
+    pagerank_map, katz_map = compute_centrality_maps(topo_graph, cfg)
+
+    x_full, valid_train = build_pair_feature_matrix(
+        full_pairs,
+        node_features,
+        remapping,
+        topo_graph,
+        pagerank_map,
+        katz_map,
+        fill_missing=False,
+    )
+    if not valid_train.all():
+        raise ValueError("Missing node features detected in pair MLP full-train pipeline.")
+
+    x_submit, valid_mask = build_pair_feature_matrix(
+        test_df.to_numpy().astype(np.int64),
+        node_features,
+        remapping,
+        topo_graph,
+        pagerank_map,
+        katz_map,
+        fill_missing=True,
+    )
+
+    x_full_s, scaler_stats = fit_feature_scaler(x_full)
+    x_submit_s = apply_feature_scaler(x_submit, scaler_stats)
+
+    model = build_model(cfg, x_full_s.shape[1]).to(device)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=cfg.pair_mlp.get("lr", cfg.training.lr),
+        weight_decay=cfg.pair_mlp.get("wd", cfg.training.wd),
+    )
+
+    batch_size = cfg.pair_mlp.get("batch_size", 256)
+    full_train_epochs = cfg.inference.get(
+        "full_train_epochs",
+        cfg.pair_mlp.get("full_train_epochs", 6),
+    )
+    train_loader = DataLoader(
+        TensorDataset(
+            torch.tensor(x_full_s, dtype=torch.float32),
+            torch.tensor(full_labels, dtype=torch.float32),
+        ),
+        batch_size=batch_size,
+        shuffle=True,
+    )
+
+    for epoch in range(1, full_train_epochs + 1):
+        model.train()
+        running_loss = 0.0
+        total_count = 0
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            batch_size_local = xb.size(0)
+            running_loss += loss.item() * batch_size_local
+            total_count += batch_size_local
+
+        print(
+            f"Epoch {epoch:02d}/{full_train_epochs} | "
+            f"loss={running_loss / max(total_count, 1):.6f}"
+        )
+
+    probs, preds = predict_pair_mlp(model, x_submit_s, device, batch_size=batch_size)
+    return probs, preds, test_df, valid_mask
+
+
+def predict_pair_mlp_from_checkpoint(cfg, device):
+    checkpoint = torch.load(cfg.inference.checkpoint_path, map_location=device, weights_only=False)
+    if not isinstance(checkpoint, dict) or checkpoint.get("kind") != "pair_mlp":
+        raise ValueError("Expected a pair_mlp checkpoint dictionary.")
+
+    topology_pairs = np.asarray(checkpoint["topology_train_pairs"].cpu().numpy(), dtype=np.int64)
+    node_feature_source = checkpoint.get("node_feature_source", cfg.pair_mlp.get("node_feature_source", "raw"))
+    node_array, _, test_df = load_pair_arrays(cfg, include_test=True)
+    node_features, remapping = build_node_feature_mapping(
+        node_array,
+        cfg,
+        feature_source=node_feature_source,
+    )
+    topo_graph = build_positive_graph(topology_pairs)
+    pagerank_map, katz_map = compute_centrality_maps(topo_graph, cfg)
+    x_submit, valid_mask = build_pair_feature_matrix(
+        test_df.to_numpy().astype(np.int64),
+        node_features,
+        remapping,
+        topo_graph,
+        pagerank_map,
+        katz_map,
+        fill_missing=True,
+    )
+    x_submit_s = apply_feature_scaler(
+        x_submit,
+        {
+            "mean": checkpoint["scaler_mean"].cpu().numpy(),
+            "scale": checkpoint["scaler_scale"].cpu().numpy(),
+        },
+    )
+
+    model = build_model(cfg, x_submit_s.shape[1]).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    probs, preds = predict_pair_mlp(
+        model,
+        x_submit_s,
+        device,
+        batch_size=cfg.pair_mlp.get("batch_size", 256),
+    )
+    return probs, preds, test_df, valid_mask
+
+
+def save_submission(test_df, probs, preds, valid_mask):
+    print(f"Valid test edges: {valid_mask.sum()} / {len(valid_mask)}")
+    print(f"Unknown-node test edges: {(~valid_mask).sum()}")
+
+    assert len(preds) == test_df.height, f"Nombre de prédictions inattendu: {len(preds)}"
+    assert test_df.height == 3498, f"Nombre de lignes test inattendu: {test_df.height}"
+
+    submission = pl.DataFrame({"ID": np.arange(len(preds)), "Predicted": preds})
+    submission.write_csv("submission.csv")
+    print("submission.csv écrit avec", submission.height, "lignes")
+    print(submission.head())
+
+    submission_proba = pl.DataFrame({"ID": np.arange(len(probs)), "Predicted": probs})
+    submission_proba.write_csv("submission_proba.csv")
+    print("submission_proba.csv écrit avec", submission_proba.height, "lignes")
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
-
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    model_kind = cfg.model.get("kind", "gnn")
 
-    test_data, test_df, valid_mask = build_test_data(cfg)
-
-    in_channels = test_data.x.size(1)
-    model = LinkPredictor(
-        in_channels,
-        cfg.model.hidden_channels,
-        cfg.model.out_channels,
-    ).to(device)
-
-    state_dict = torch.load(cfg.inference.checkpoint_path, map_location=device)
-    model.load_state_dict(state_dict)
-
-    probs, preds = predict(model, test_data, device)
-
-    full_preds = np.zeros(test_df.height, dtype=int)      # fallback = 0
-    full_probs = np.zeros(test_df.height, dtype=float)    # fallback prob = 0.0
-
-    full_preds[valid_mask] = preds
-    full_probs[valid_mask] = probs
-
-    print(f"Valid test edges: {valid_mask.sum()} / {len(valid_mask)}")
-    print(f"Unknown-node test edges: {(~valid_mask).sum()}")
-
-    # verification for kaggle 
-    assert len(full_preds) == 3498, f"Nombre de prédictions inattendu: {len(preds)}"
-    assert test_df.height == 3498, f"Nombre de lignes test inattendu: {test_df.height}"
-
-    submission = pl.DataFrame({
-    "ID": np.arange(len(full_preds)),
-    "Predicted": full_preds,
-    })
-
-    submission.write_csv("submission.csv")
-    print("submission.csv écrit avec", submission.height, "lignes")
-    print(submission.head())
+    if model_kind == "pair_mlp":
+        if cfg.inference.get("refit_on_full_train", False):
+            probs, preds, test_df, valid_mask = fit_pair_mlp_full_train(cfg, device)
+        else:
+            probs, preds, test_df, valid_mask = predict_pair_mlp_from_checkpoint(cfg, device)
+        save_submission(test_df, probs, preds, valid_mask)
+    else:
+        test_data, test_df, valid_mask = build_gnn_test_data(cfg)
+        model = build_model(cfg, test_data.x.size(1)).to(device)
+        state = torch.load(cfg.inference.checkpoint_path, map_location=device)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        model.load_state_dict(state)
+        probs, preds = predict_gnn(model, test_data, device)
+        save_submission(test_df, probs, preds, valid_mask)
 
     if cfg.inference.submit:
         cmd = [

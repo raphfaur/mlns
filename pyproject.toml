@@ -8,6 +8,7 @@ dependencies = [
     "hydra-core>=1.3.2",
     "kaggle>=2.0.0",
     "matplotlib>=3.10.8",
+    "networkx>=3.6",
     "numpy>=2.4.4",
     "polars>=1.39.3",
     "pyyaml>=6.0.3",
