@@ -1,8 +1,15 @@
+from pathlib import Path
+
 import torch 
 from torch_geometric.data import Data
 import polars 
 import numpy as np
 from sklearn.decomposition import TruncatedSVD
+
+
+def resolve_data_path(data_base_path, filename):
+    repo_root = Path(__file__).resolve().parents[1]
+    return repo_root / data_base_path / filename
 
 
 def build_node_features(node_array, cfg):
@@ -45,10 +52,15 @@ def build_node_features(node_array, cfg):
 
 def make_datasets(cfg) : 
     data_node = polars.read_csv(
-        "../../../" + cfg.data.DATA_BASE_PATH + "node_information.csv",
+        resolve_data_path(cfg.data.DATA_BASE_PATH, "node_information.csv"),
         has_header=False,
     )
-    edges_df = polars.read_csv("../../../" + cfg.data.DATA_BASE_PATH + "train.txt", separator=" ", has_header=False, new_columns=["a", "b", "label"])
+    edges_df = polars.read_csv(
+        resolve_data_path(cfg.data.DATA_BASE_PATH, "train.txt"),
+        separator=" ",
+        has_header=False,
+        new_columns=["a", "b", "label"],
+    )
     node_array = data_node.to_numpy()
     edge_array = edges_df.to_numpy()
 

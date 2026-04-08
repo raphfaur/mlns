@@ -11,6 +11,12 @@ from omegaconf import DictConfig, OmegaConf
 import wandb
 
 from eval import evaluate as evaluate_gnn
+from handcrafted_gnn import build_handcrafted_gnn_train_datasets
+from handcrafted_features import (
+    build_handcrafted_context,
+    build_handcrafted_feature_matrix_with_context,
+    resolve_handcrafted_feature_names,
+)
 from models import build_model
 from make_dataset import make_datasets
 from pair_features import (
@@ -21,12 +27,33 @@ from pair_features import (
     compute_centrality_maps,
     fit_feature_scaler,
     load_pair_arrays,
+    resolve_node_csv_has_header,
 )
 
 
 def build_pair_training_cfg(cfg):
     pair_cfg = cfg.get("pair_mlp", {})
     base_cfg = cfg.training
+    feature_builder = pair_cfg.get("feature_builder", "pairwise_rich")
+    if feature_builder == "handcrafted":
+        return {
+            "epochs": pair_cfg.get("handcrafted_epochs", 200),
+            "lr": pair_cfg.get("handcrafted_lr", 2e-3),
+            "wd": pair_cfg.get("handcrafted_wd", 0.0),
+            "eval_every": pair_cfg.get("handcrafted_eval_every", 1),
+            "patience": pair_cfg.get("handcrafted_patience", 50),
+            "min_delta": pair_cfg.get("min_delta", 1e-5),
+            "label_smoothing": pair_cfg.get(
+                "label_smoothing",
+                base_cfg.get("label_smoothing", 0.0),
+            ),
+            "grad_clip": pair_cfg.get("grad_clip", base_cfg.get("grad_clip", None)),
+            "use_scheduler": pair_cfg.get("handcrafted_use_scheduler", True),
+            "lr_patience": pair_cfg.get("handcrafted_lr_patience", 4),
+            "lr_decay_factor": pair_cfg.get("handcrafted_lr_decay_factor", 0.5),
+            "min_lr": pair_cfg.get("handcrafted_min_lr", 1e-5),
+        }
+
     return {
         "epochs": pair_cfg.get("epochs", base_cfg.epochs),
         "lr": pair_cfg.get("lr", base_cfg.lr),
@@ -49,6 +76,225 @@ def build_pair_training_cfg(cfg):
     }
 
 
+def build_handcrafted_gnn_training_cfg(cfg):
+    gnn_cfg = cfg.get("gnn_handcrafted", {})
+    base_cfg = cfg.training
+    return {
+        "epochs": gnn_cfg.get("epochs", 250),
+        "lr": gnn_cfg.get("lr", base_cfg.lr),
+        "wd": gnn_cfg.get("wd", base_cfg.wd),
+        "eval_every": gnn_cfg.get("eval_every", base_cfg.get("eval_every", 10)),
+        "patience": gnn_cfg.get("patience", base_cfg.get("patience", 20)),
+        "min_delta": gnn_cfg.get("min_delta", base_cfg.get("min_delta", 1e-4)),
+        "label_smoothing": gnn_cfg.get(
+            "label_smoothing",
+            base_cfg.get("label_smoothing", 0.0),
+        ),
+        "grad_clip": gnn_cfg.get("grad_clip", base_cfg.get("grad_clip", None)),
+        "lr_patience": gnn_cfg.get("lr_patience", base_cfg.get("lr_patience", 4)),
+        "lr_decay_factor": gnn_cfg.get(
+            "lr_decay_factor",
+            base_cfg.get("lr_decay_factor", 0.5),
+        ),
+        "min_lr": gnn_cfg.get("min_lr", base_cfg.get("min_lr", 1e-5)),
+    }
+
+
+def resolve_pair_topology_source(cfg):
+    pair_cfg = cfg.get("pair_mlp", {})
+    topology_source = pair_cfg.get("topology_source", "auto")
+    if topology_source == "auto":
+        return "all_positive" if pair_cfg.get("notebook_compat", False) else "train_positive"
+    if topology_source not in {"train_positive", "all_positive"}:
+        raise ValueError(f"Unknown pair_mlp.topology_source: {topology_source}")
+    return topology_source
+
+
+def build_pair_datasets(cfg, node_features, remapping, pairs, labels):
+    pair_cfg = cfg.get("pair_mlp", {})
+    notebook_compat = pair_cfg.get("notebook_compat", False)
+    topology_source = resolve_pair_topology_source(cfg)
+    feature_builder = pair_cfg.get("feature_builder", "pairwise_rich")
+    node_pair_representation = pair_cfg.get("node_pair_representation", "concat")
+    handcrafted_feature_names = None
+    if feature_builder == "handcrafted":
+        handcrafted_feature_names = resolve_handcrafted_feature_names(cfg)
+
+    if notebook_compat:
+        topology_pairs = pairs[labels == 1] if topology_source == "all_positive" else pairs
+        if topology_source == "train_positive":
+            raise ValueError(
+                "pair_mlp.notebook_compat=true expects topology_source=all_positive "
+                "or auto."
+            )
+
+        topo_graph = build_positive_graph(topology_pairs)
+        if feature_builder == "handcrafted":
+            context = build_handcrafted_context(topo_graph, cfg)
+            x_all, valid_mask = build_handcrafted_feature_matrix_with_context(
+                pairs,
+                node_features,
+                remapping,
+                topo_graph,
+                context,
+                handcrafted_feature_names,
+                fill_missing=False,
+            )
+        else:
+            pagerank_map, katz_map = compute_centrality_maps(topo_graph, cfg)
+            x_all, valid_mask = build_pair_feature_matrix(
+                pairs,
+                node_features,
+                remapping,
+                topo_graph,
+                pagerank_map,
+                katz_map,
+                fill_missing=False,
+                node_pair_representation=node_pair_representation,
+            )
+        y_all = labels[valid_mask]
+
+        if feature_builder == "handcrafted":
+            x_temp, x_test, y_temp, y_test = train_test_split(
+                x_all,
+                y_all,
+                test_size=pair_cfg.get("validation_split", cfg.data.test_size),
+                random_state=42,
+                stratify=y_all,
+            )
+            x_train, x_val, train_labels, val_labels = train_test_split(
+                x_temp,
+                y_temp,
+                test_size=0.25,
+                random_state=42,
+                stratify=y_temp,
+            )
+        else:
+            validation_split = pair_cfg.get("validation_split", cfg.data.test_size)
+            x_train, x_val, train_labels, val_labels = train_test_split(
+                x_all,
+                y_all,
+                test_size=validation_split,
+                random_state=42,
+                stratify=y_all,
+            )
+            x_test, y_test = None, None
+
+        return {
+            "x_train": x_train,
+            "y_train": train_labels,
+            "x_val": x_val,
+            "y_val": val_labels,
+            "x_test": x_test,
+            "y_test": y_test,
+            "topology_pairs": topology_pairs,
+            "mode": "notebook_compat",
+            "feature_builder": feature_builder,
+            "handcrafted_feature_names": handcrafted_feature_names,
+        }
+
+    all_idx = np.arange(len(labels))
+    train_idx, temp_idx = train_test_split(
+        all_idx,
+        test_size=cfg.data.test_size,
+        random_state=42,
+        stratify=labels,
+    )
+    val_idx, test_idx = train_test_split(
+        temp_idx,
+        test_size=0.5,
+        random_state=42,
+        stratify=labels[temp_idx],
+    )
+
+    train_pairs = pairs[train_idx]
+    train_labels = labels[train_idx]
+    val_pairs = pairs[val_idx]
+    val_labels = labels[val_idx]
+    test_pairs = pairs[test_idx]
+    test_labels = labels[test_idx]
+
+    topology_pairs = pairs[labels == 1] if topology_source == "all_positive" else train_pairs[train_labels == 1]
+    topo_graph = build_positive_graph(topology_pairs)
+    if feature_builder == "handcrafted":
+        context = build_handcrafted_context(topo_graph, cfg)
+        x_train, train_valid = build_handcrafted_feature_matrix_with_context(
+            train_pairs,
+            node_features,
+            remapping,
+            topo_graph,
+            context,
+            handcrafted_feature_names,
+            fill_missing=False,
+        )
+        x_val, val_valid = build_handcrafted_feature_matrix_with_context(
+            val_pairs,
+            node_features,
+            remapping,
+            topo_graph,
+            context,
+            handcrafted_feature_names,
+            fill_missing=False,
+        )
+        x_test, test_valid = build_handcrafted_feature_matrix_with_context(
+            test_pairs,
+            node_features,
+            remapping,
+            topo_graph,
+            context,
+            handcrafted_feature_names,
+            fill_missing=False,
+        )
+    else:
+        pagerank_map, katz_map = compute_centrality_maps(topo_graph, cfg)
+        x_train, train_valid = build_pair_feature_matrix(
+            train_pairs,
+            node_features,
+            remapping,
+            topo_graph,
+            pagerank_map,
+            katz_map,
+            fill_missing=False,
+            node_pair_representation=node_pair_representation,
+        )
+        x_val, val_valid = build_pair_feature_matrix(
+            val_pairs,
+            node_features,
+            remapping,
+            topo_graph,
+            pagerank_map,
+            katz_map,
+            fill_missing=False,
+            node_pair_representation=node_pair_representation,
+        )
+        x_test, test_valid = build_pair_feature_matrix(
+            test_pairs,
+            node_features,
+            remapping,
+            topo_graph,
+            pagerank_map,
+            katz_map,
+            fill_missing=False,
+            node_pair_representation=node_pair_representation,
+        )
+
+    if not train_valid.all() or not val_valid.all() or not test_valid.all():
+        raise ValueError("Missing node features detected in pair MLP pipeline.")
+
+    return {
+        "x_train": x_train,
+        "y_train": train_labels,
+        "x_val": x_val,
+        "y_val": val_labels,
+        "x_test": x_test,
+        "y_test": test_labels,
+        "topology_pairs": topology_pairs,
+        "mode": "strict",
+        "feature_builder": feature_builder,
+        "handcrafted_feature_names": handcrafted_feature_names,
+    }
+
+
 def smooth_binary_targets(targets, label_smoothing):
     if label_smoothing <= 0.0:
         return targets
@@ -63,6 +309,8 @@ def train_gnn_step(model, optimizer, train_data, criterion, label_smoothing=0.0,
         train_data.x,
         train_data.edge_index,
         train_data.edge_label_index,
+        edge_attr=getattr(train_data, "edge_attr", None),
+        edge_label_attr=getattr(train_data, "edge_label_attr", None),
     )
     targets = smooth_binary_targets(train_data.edge_label.float(), label_smoothing)
     loss = criterion(logits, targets)
@@ -289,6 +537,92 @@ def train_gnn(cfg, device):
     print(f"test acc {test_acc:.4f}, Test AUC: {test_auc:.4f}, Test AP: {test_ap:.4f}")
 
 
+def train_handcrafted_gnn(cfg, device):
+    datasets = build_handcrafted_gnn_train_datasets(cfg)
+    train_cfg = build_handcrafted_gnn_training_cfg(cfg)
+
+    cfg.gnn_handcrafted.edge_input_dim = datasets["edge_input_dim"]
+    model = build_model(cfg, datasets["node_input_dim"]).to(device)
+    wandb.watch(model, log="all")
+
+    train_data = datasets["train_data"].to(device)
+    val_data = datasets["val_data"].to(device)
+    test_data = datasets["test_data"].to(device)
+
+    optimizer = AdamW(
+        model.parameters(),
+        lr=train_cfg["lr"],
+        weight_decay=train_cfg["wd"],
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=train_cfg.get("lr_decay_factor", 0.5),
+        patience=train_cfg.get("lr_patience", 4),
+        min_lr=train_cfg.get("min_lr", 1e-5),
+    )
+    criterion = nn.BCEWithLogitsLoss()
+
+    def train_epoch(label_smoothing, grad_clip):
+        return train_gnn_step(
+            model,
+            optimizer,
+            train_data,
+            criterion,
+            label_smoothing=label_smoothing,
+            grad_clip=grad_clip,
+        )
+
+    def evaluate_val():
+        return evaluate_gnn(val_data, model, criterion)
+
+    def save_payload():
+        return {
+            "kind": "gnn_handcrafted",
+            "model_state_dict": model.state_dict(),
+            "topology_pairs": datasets["topology_pairs"],
+            "node_feature_names": datasets["node_feature_names"],
+            "edge_feature_names": datasets["edge_feature_names"],
+            "node_scaler_mean": torch.tensor(datasets["node_stats"]["mean"], dtype=torch.float32),
+            "node_scaler_scale": torch.tensor(datasets["node_stats"]["scale"], dtype=torch.float32),
+            "edge_scaler_mean": torch.tensor(datasets["edge_stats"]["mean"], dtype=torch.float32),
+            "edge_scaler_scale": torch.tensor(datasets["edge_stats"]["scale"], dtype=torch.float32),
+            "node_feature_source": datasets["node_feature_source"],
+            "node_input_mode": datasets["node_input_mode"],
+            "gnn_handcrafted_model_config": {
+                "hidden_channels": cfg.gnn_handcrafted.get("hidden_channels", 32),
+                "out_channels": cfg.gnn_handcrafted.get("out_channels", 16),
+                "decoder_hidden": cfg.gnn_handcrafted.get(
+                    "decoder_hidden",
+                    cfg.gnn_handcrafted.get("hidden_channels", 32),
+                ),
+                "dropout": cfg.gnn_handcrafted.get("dropout", 0.5),
+                "edge_dropout": cfg.gnn_handcrafted.get("edge_dropout", 0.0),
+                "feature_dropout": cfg.gnn_handcrafted.get("feature_dropout", 0.0),
+                "edge_feature_dropout": cfg.gnn_handcrafted.get("edge_feature_dropout", 0.0),
+                "decoder_scale_init": cfg.gnn_handcrafted.get("decoder_scale_init", 3.0),
+                "edge_input_dim": datasets["edge_input_dim"],
+            },
+        }
+
+    train_with_early_stopping(
+        train_cfg,
+        model,
+        optimizer,
+        scheduler,
+        criterion,
+        train_epoch,
+        evaluate_val,
+        save_payload,
+    )
+
+    checkpoint = torch.load("best_model.pt", map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    _, test_acc, test_auc, test_ap = evaluate_gnn(test_data, model, criterion)
+    wandb.log({"test_acc": test_acc, "test_auc": test_auc, "test_ap": test_ap})
+    print(f"test acc {test_acc:.4f}, Test AUC: {test_auc:.4f}, Test AP: {test_ap:.4f}")
+
+
 def train_pair_mlp(cfg, device):
     node_array, train_array = load_pair_arrays(cfg, include_test=False)
     node_features, remapping = build_node_feature_mapping(node_array, cfg)
@@ -296,70 +630,30 @@ def train_pair_mlp(cfg, device):
 
     pairs = train_array[:, :2].astype(np.int64)
     labels = train_array[:, 2].astype(np.float32)
-    all_idx = np.arange(len(labels))
-    train_idx, temp_idx = train_test_split(
-        all_idx,
-        test_size=cfg.data.test_size,
-        random_state=42,
-        stratify=labels,
-    )
-    val_idx, test_idx = train_test_split(
-        temp_idx,
-        test_size=0.5,
-        random_state=42,
-        stratify=labels[temp_idx],
-    )
-
-    train_pairs = pairs[train_idx]
-    train_labels = labels[train_idx]
-    val_pairs = pairs[val_idx]
-    val_labels = labels[val_idx]
-    test_pairs = pairs[test_idx]
-    test_labels = labels[test_idx]
-
-    topology_train_pairs = train_pairs[train_labels == 1]
-    topo_graph = build_positive_graph(topology_train_pairs)
-    pagerank_map, katz_map = compute_centrality_maps(topo_graph, cfg)
-
-    x_train, train_valid = build_pair_feature_matrix(
-        train_pairs,
-        node_features,
-        remapping,
-        topo_graph,
-        pagerank_map,
-        katz_map,
-        fill_missing=False,
-    )
-    x_val, val_valid = build_pair_feature_matrix(
-        val_pairs,
-        node_features,
-        remapping,
-        topo_graph,
-        pagerank_map,
-        katz_map,
-        fill_missing=False,
-    )
-    x_test, test_valid = build_pair_feature_matrix(
-        test_pairs,
-        node_features,
-        remapping,
-        topo_graph,
-        pagerank_map,
-        katz_map,
-        fill_missing=False,
-    )
-
-    if not train_valid.all() or not val_valid.all() or not test_valid.all():
-        raise ValueError("Missing node features detected in pair MLP pipeline.")
+    datasets = build_pair_datasets(cfg, node_features, remapping, pairs, labels)
+    x_train = datasets["x_train"]
+    train_labels = datasets["y_train"]
+    x_val = datasets["x_val"]
+    val_labels = datasets["y_val"]
+    x_test = datasets["x_test"]
+    test_labels = datasets["y_test"]
+    topology_train_pairs = datasets["topology_pairs"]
+    split_mode = datasets["mode"]
+    feature_builder = datasets["feature_builder"]
+    handcrafted_feature_names = datasets["handcrafted_feature_names"]
 
     x_train_s, scaler_stats = fit_feature_scaler(x_train)
     x_val_s = apply_feature_scaler(x_val, scaler_stats)
-    x_test_s = apply_feature_scaler(x_test, scaler_stats)
+    x_test_s = apply_feature_scaler(x_test, scaler_stats) if x_test is not None else None
 
     batch_size = cfg.pair_mlp.get("batch_size", 256)
     train_loader = make_pair_loader(x_train_s, train_labels, batch_size=batch_size, shuffle=True)
     val_loader = make_pair_loader(x_val_s, val_labels, batch_size=batch_size, shuffle=False)
-    test_loader = make_pair_loader(x_test_s, test_labels, batch_size=batch_size, shuffle=False)
+    test_loader = (
+        make_pair_loader(x_test_s, test_labels, batch_size=batch_size, shuffle=False)
+        if x_test_s is not None
+        else None
+    )
 
     model = build_model(cfg, x_train_s.shape[1]).to(device)
     wandb.watch(model, log="all")
@@ -411,7 +705,25 @@ def train_pair_mlp(cfg, device):
             "scaler_scale": torch.tensor(scaler_stats["scale"], dtype=torch.float32),
             "topology_train_pairs": torch.tensor(topology_train_pairs, dtype=torch.long),
             "input_dim": int(x_train_s.shape[1]),
+            "feature_builder": feature_builder,
+            "pair_mlp_model_config": {
+                "proj_dim": cfg.pair_mlp.get("proj_dim", 64),
+                "handcrafted_proj_dim": cfg.pair_mlp.get(
+                    "handcrafted_proj_dim",
+                    cfg.pair_mlp.get("proj_dim", 64),
+                ),
+                "hidden_dim_1": cfg.pair_mlp.get("hidden_dim_1", 64),
+                "hidden_dim_2": cfg.pair_mlp.get("hidden_dim_2", 32),
+                "dropout_1": cfg.pair_mlp.get("dropout_1", 0.30),
+                "dropout_2": cfg.pair_mlp.get("dropout_2", 0.25),
+                "dropout_3": cfg.pair_mlp.get("dropout_3", 0.15),
+                "batch_size": cfg.pair_mlp.get("batch_size", 256),
+            },
             "node_feature_source": cfg.pair_mlp.get("node_feature_source", "raw"),
+            "node_csv_has_header": resolve_node_csv_has_header(cfg),
+            "node_pair_representation": cfg.pair_mlp.get("node_pair_representation", "concat"),
+            "handcrafted_feature_names": handcrafted_feature_names,
+            "split_mode": split_mode,
         }
 
     train_with_early_stopping(
@@ -427,16 +739,45 @@ def train_pair_mlp(cfg, device):
 
     checkpoint = torch.load("best_model.pt", map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model_state_dict"])
-    _, test_acc, test_auc, test_ap = evaluate_pair_mlp(test_loader, model, criterion, device)
-    wandb.log({"test_acc": test_acc, "test_auc": test_auc, "test_ap": test_ap})
-    print(f"test acc {test_acc:.4f}, Test AUC: {test_auc:.4f}, Test AP: {test_ap:.4f}")
+    if test_loader is None:
+        final_val_loss, final_val_acc, final_val_auc, final_val_ap = evaluate_pair_mlp(
+            val_loader,
+            model,
+            criterion,
+            device,
+        )
+        wandb.log(
+            {
+                "final_val_loss": final_val_loss,
+                "final_val_acc": final_val_acc,
+                "final_val_auc": final_val_auc,
+                "final_val_ap": final_val_ap,
+            }
+        )
+        print(
+            f"final val acc {final_val_acc:.4f}, "
+            f"Final Val AUC: {final_val_auc:.4f}, Final Val AP: {final_val_ap:.4f}"
+        )
+    else:
+        _, test_acc, test_auc, test_ap = evaluate_pair_mlp(test_loader, model, criterion, device)
+        wandb.log({"test_acc": test_acc, "test_auc": test_auc, "test_ap": test_ap})
+        print(f"test acc {test_acc:.4f}, Test AUC: {test_auc:.4f}, Test AP: {test_ap:.4f}")
 
 
 def build_run_name(cfg):
     model_kind = cfg.model.get("kind", "gnn")
     if model_kind == "pair_mlp":
         pair_train_cfg = build_pair_training_cfg(cfg)
-        return f"pairmlp_p{cfg.pair_mlp.get('proj_dim', 64)}_lr{pair_train_cfg['lr']}"
+        suffix = "_nb" if cfg.pair_mlp.get("notebook_compat", False) else ""
+        feature_builder = cfg.pair_mlp.get("feature_builder", "pairwise_rich")
+        if feature_builder == "handcrafted":
+            preset = cfg.pair_mlp.get("handcrafted_preset", "custom")
+            return f"pairmlp_hf_{preset}_lr{pair_train_cfg['lr']}{suffix}"
+        return f"pairmlp_p{cfg.pair_mlp.get('proj_dim', 64)}_lr{pair_train_cfg['lr']}{suffix}"
+    if model_kind == "gnn_handcrafted":
+        gnn_cfg = cfg.get("gnn_handcrafted", {})
+        preset = gnn_cfg.get("edge_preset", "custom")
+        return f"hgnn_{preset}_h{gnn_cfg.get('hidden_channels', 32)}_lr{gnn_cfg.get('lr', cfg.training.lr)}"
     return f"gnn_h{cfg.model.hidden_channels}_lr{cfg.training.lr}"
 
 
@@ -458,6 +799,10 @@ def main(cfg: DictConfig):
 
     if model_kind == "gnn":
         train_gnn(cfg, device)
+        return
+
+    if model_kind == "gnn_handcrafted":
+        train_handcrafted_gnn(cfg, device)
         return
 
     raise ValueError(f"Unknown model.kind: {model_kind}")

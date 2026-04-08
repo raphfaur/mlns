@@ -7,7 +7,9 @@ def evaluate(split_data,model,criterion):
     logits = model(
         split_data.x,
         split_data.edge_index,
-        split_data.edge_label_index
+        split_data.edge_label_index,
+        edge_attr=getattr(split_data, "edge_attr", None),
+        edge_label_attr=getattr(split_data, "edge_label_attr", None),
     )
     loss = criterion(logits, split_data.edge_label.float())
     probs = torch.sigmoid(logits).cpu().numpy()

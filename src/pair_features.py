@@ -5,14 +5,29 @@ import numpy as np
 import polars as pl
 from sklearn.preprocessing import StandardScaler
 
-from make_dataset import build_node_features
+from make_dataset import build_node_features, resolve_data_path
 
 
-def load_pair_arrays(cfg, include_test=False):
-    base = "../../../" + cfg.data.DATA_BASE_PATH
-    node_array = pl.read_csv(base + "node_information.csv", has_header=False).to_numpy()
+def resolve_node_csv_has_header(cfg):
+    pair_cfg = cfg.get("pair_mlp", {})
+    value = pair_cfg.get("node_csv_has_header", "auto")
+    if isinstance(value, bool):
+        return value
+    if value != "auto":
+        raise ValueError(f"Unknown pair_mlp.node_csv_has_header value: {value}")
+
+    feature_builder = pair_cfg.get("feature_builder", "pairwise_rich")
+    notebook_compat = pair_cfg.get("notebook_compat", False)
+    return bool(feature_builder == "handcrafted" and notebook_compat)
+
+
+def load_pair_arrays(cfg, include_test=False, node_csv_has_header=None):
+    node_array = pl.read_csv(
+        resolve_data_path(cfg.data.DATA_BASE_PATH, "node_information.csv"),
+        has_header=resolve_node_csv_has_header(cfg) if node_csv_has_header is None else node_csv_has_header,
+    ).to_numpy()
     train_array = pl.read_csv(
-        base + "train.txt",
+        resolve_data_path(cfg.data.DATA_BASE_PATH, "train.txt"),
         separator=" ",
         has_header=False,
         new_columns=["a", "b", "label"],
@@ -22,7 +37,7 @@ def load_pair_arrays(cfg, include_test=False):
         return node_array, train_array
 
     test_df = pl.read_csv(
-        base + "test.txt",
+        resolve_data_path(cfg.data.DATA_BASE_PATH, "test.txt"),
         separator=" ",
         has_header=False,
         new_columns=["a", "b"],
@@ -134,14 +149,31 @@ def centrality_pair_features(a, b, pagerank_map, katz_map):
     )
 
 
-def extra_pair_features(fa, fb):
+def cosine_similarity_feature(fa, fb):
+    return float(np.dot(fa, fb) / (np.linalg.norm(fa) * np.linalg.norm(fb) + 1e-8))
+
+
+def build_node_pair_representation(fa, fb, representation="concat"):
+    if representation == "concat":
+        return np.concatenate([fa, fb]).astype(np.float32)
+
+    if representation == "cosine":
+        return np.array([cosine_similarity_feature(fa, fb)], dtype=np.float32)
+
+    if representation in {"cosine_no_duplicate", "cosine_no_duplictae"}:
+        return np.array([cosine_similarity_feature(fa, fb)], dtype=np.float32)
+
+    raise ValueError(f"Unknown pair_mlp.node_pair_representation: {representation}")
+
+
+def extra_pair_features(fa, fb, include_cosine=True):
     diff = fa - fb
     abs_diff = np.abs(diff)
     prod = fa * fb
 
     l1 = float(abs_diff.sum())
     l2 = float(np.sqrt((diff ** 2).sum()))
-    cos = float(np.dot(fa, fb) / (np.linalg.norm(fa) * np.linalg.norm(fb) + 1e-8))
+    cos = cosine_similarity_feature(fa, fb)
     dot = float(np.dot(fa, fb))
 
     mean_abs = float(abs_diff.mean())
@@ -149,7 +181,11 @@ def extra_pair_features(fa, fb):
     mean_prod = float(prod.mean())
     std_prod = float(prod.std())
 
-    return np.array([l1, l2, cos, dot, mean_abs, max_abs, mean_prod, std_prod], dtype=np.float32)
+    features = [l1, l2, dot, mean_abs, max_abs, mean_prod, std_prod]
+    if include_cosine:
+        features.insert(2, cos)
+
+    return np.array(features, dtype=np.float32)
 
 
 def build_pair_feature_matrix(
@@ -160,6 +196,7 @@ def build_pair_feature_matrix(
     pagerank_map,
     katz_map,
     fill_missing=False,
+    node_pair_representation="concat",
 ):
     features = []
     valid_mask = []
@@ -180,10 +217,19 @@ def build_pair_feature_matrix(
         else:
             continue
 
+        node_pair = build_node_pair_representation(
+            fa,
+            fb,
+            representation=node_pair_representation,
+        )
         topo = topo_pair_features(graph, a, b)
-        extra = extra_pair_features(fa, fb)
+        include_cosine = node_pair_representation not in {
+            "cosine_no_duplicate",
+            "cosine_no_duplictae",
+        }
+        extra = extra_pair_features(fa, fb, include_cosine=include_cosine)
         cent = centrality_pair_features(a, b, pagerank_map, katz_map)
-        features.append(np.concatenate([fa, fb, topo, extra, cent]).astype(np.float32))
+        features.append(np.concatenate([node_pair, topo, extra, cent]).astype(np.float32))
 
     return np.array(features, dtype=np.float32), np.array(valid_mask, dtype=bool)
 

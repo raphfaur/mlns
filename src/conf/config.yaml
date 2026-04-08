@@ -12,8 +12,59 @@ model :
   feature_dropout : 0.08
   decoder_scale_init : 5.0
 
+gnn_handcrafted:
+  node_feature_source: "raw"  # raw | preprocessed
+  node_input_mode: "structural_only"  # structural_only | base_plus_structural | base_only
+  node_preset: "structural_small"
+  node_selected_features: []
+  edge_preset: "best83"
+  edge_selected_features: []
+  edge_input_dim: null
+  hidden_channels: 32
+  out_channels: 16
+  decoder_hidden: 32
+  dropout: 0.5
+  edge_dropout: 0.2
+  feature_dropout: 0.15
+  edge_feature_dropout: 0.2
+  decoder_scale_init: 3.0
+  lr: 0.0007
+  wd: 0.005
+  epochs: 2000
+  eval_every: 5
+  patience: 20
+  min_delta: 0.0005
+  label_smoothing: 0.02
+  grad_clip: 1.0
+  lr_patience: 4
+  lr_decay_factor: 0.5
+  min_lr: 0.00005
+  pagerank_alpha: 0.85
+  katz_alpha: 0.005
+  katz_beta: 1.0
+  katz_max_iter: 1000
+  katz_tol: 1.0e-6
+
 pair_mlp:
+  feature_builder : "pairwise_rich"  # pairwise_rich | handcrafted
   node_feature_source : "raw"
+  node_csv_has_header : "auto"
+  node_pair_representation : "concat"  # concat | cosine | cosine_no_duplicate
+  notebook_compat : false
+  validation_split : 0.2
+  topology_source : "auto"
+  handcrafted_preset : "baseline_small"
+  handcrafted_selected_features : []
+  handcrafted_proj_dim : 128
+  handcrafted_lr : 0.002
+  handcrafted_wd : 0.0
+  handcrafted_epochs : 200
+  handcrafted_eval_every : 1
+  handcrafted_patience : 50
+  handcrafted_use_scheduler : true
+  handcrafted_lr_patience : 4
+  handcrafted_lr_decay_factor : 0.5
+  handcrafted_min_lr : 0.00001
   proj_dim : 64
   hidden_dim_1 : 64
   hidden_dim_2 : 32
@@ -62,6 +113,32 @@ data :
 inference:
   checkpoint_path: "best_model.pt"
   refit_on_full_train: false
-  full_train_epochs: 200
+  full_train_epochs: 6
   submit: true
   message: "GCN baseline"
+
+search:
+  n_trials: 20
+  seed: 42
+  output_dir: "search_results"
+  top_k: 5
+  feature_selection_mode: "presets"  # presets | subsets | mixed
+  presets: ["baseline_small", "legacy_best_like", "all"]
+  preset_probability: 0.4
+  candidate_features: []
+  mandatory_features: []
+  subset_min_size: 6
+  subset_max_size: 16
+  proj_dims: [64, 128, 256]
+  hidden_dim_1: [64, 128]
+  hidden_dim_2: [32, 64]
+  dropout_1: [0.2, 0.3, 0.4]
+  dropout_2: [0.15, 0.25, 0.35]
+  dropout_3: [0.1, 0.15, 0.2]
+  lr_min: 0.0003
+  lr_max: 0.003
+  wd_min: 0.0
+  wd_max: 0.01
+  batch_sizes: [128, 256]
+  patience: [12, 20, 35, 50]
+  lr_patience: [3, 4, 6]
